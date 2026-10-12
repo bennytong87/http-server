@@ -1,0 +1,6 @@
+server
+*.o
+*.log
+.vscode/
+.idea/
+*.swp
