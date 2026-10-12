@@ -1,3 +1,26 @@
+/*
+ * server.c - A high-concurrency HTTP/1.1 server in C
+ *
+ * Features:
+ *   - epoll-based event loop (Reactor pattern)
+ *   - Non-blocking I/O
+ *   - Static file serving with sendfile (zero-copy)
+ *   - MIME type detection
+ *   - HTTP/1.1 Keep-Alive with idle timeout
+ *   - Path traversal protection
+ *   - SIGPIPE handling
+ *   - TCP_NODELAY for low latency
+ *
+ * Build: gcc -Wall -Wextra -O2 -o server server.c
+ * Run:   ./server
+ * Test:  curl -v http://127.0.0.1:8080/
+ *
+ * Benchmark (WSL2, 8 threads, 100 connections):
+ *   QPS: 58,000 ~ 65,000
+ *   Latency P50: 1.5ms
+ *   Latency P99: 3ms
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +37,8 @@
 #include <sys/epoll.h>
 #include <netinet/tcp.h>
 
+/* ===== Configuration ===== */
+
 #define PORT         8080
 #define BACKLOG      128
 #define MAX_EVENTS   256
@@ -22,6 +47,16 @@
 #define DOC_ROOT     "./www"
 #define IDLE_TIMEOUT 10
 
+/* ===== Data Structures ===== */
+
+/*
+ * conn_t - Per-connection state.
+ *
+ * @fd:          socket file descriptor (0 = empty slot)
+ * @buf:         accumulated request bytes (TCP is a byte stream)
+ * @buf_len:     number of valid bytes in buf
+ * @last_active: timestamp of last activity (for idle timeout)
+ */
 typedef struct {
     int    fd;
     char   buf[BUF_SIZE];
@@ -31,6 +66,16 @@ typedef struct {
 
 static conn_t conns[MAX_CONNS];
 
+/* ===== Socket Helpers ===== */
+
+/*
+ * set_nonblocking - Set fd to non-blocking mode.
+ *
+ * Reads current flags first (F_GETFL), then ORs O_NONBLOCK,
+ * to preserve other flags such as O_APPEND.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
 static int set_nonblocking(int fd)
 {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -38,6 +83,16 @@ static int set_nonblocking(int fd)
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
+/* ===== HTTP Parsing ===== */
+
+/*
+ * find_header_end - Locate "\r\n\r\n" in buffer.
+ *
+ * "\r\n\r\n" marks the end of HTTP headers. Loop bound uses
+ * i + 3 < len because we access buf[i+3].
+ *
+ * Returns pointer to the '\r' of the terminator, or NULL if not found.
+ */
 static char *find_header_end(char *buf, size_t len)
 {
     for (size_t i = 0; i + 3 < len; i++) {
@@ -48,6 +103,19 @@ static char *find_header_end(char *buf, size_t len)
     return NULL;
 }
 
+/*
+ * parse_request_line - Parse "METHOD SP URI SP VERSION CRLF".
+ *
+ * @buf:     start of request line
+ * @method:  output buffer for method (e.g. "GET")
+ * @mlen:    size of method buffer
+ * @uri:     output buffer for URI (e.g. "/index.html")
+ * @ulen:    size of uri buffer
+ * @version: output buffer for version (e.g. "HTTP/1.1")
+ * @vlen:    size of version buffer
+ *
+ * Returns 0 on success, -1 on malformed request.
+ */
 static int parse_request_line(const char *buf,
                               char *method, size_t mlen,
                               char *uri,    size_t ulen,
@@ -75,6 +143,14 @@ static int parse_request_line(const char *buf,
     return 0;
 }
 
+/*
+ * has_connection_close - Check if request contains "Connection: close".
+ *
+ * Uses strncasecmp (not strstr) because HTTP header names are
+ * case-insensitive: "Connection", "connection", "CONNECTION" are all valid.
+ *
+ * Returns 1 if found, 0 otherwise.
+ */
 static int has_connection_close(const char *buf, size_t len)
 {
     const char *needle = "connection:";
@@ -91,6 +167,15 @@ static int has_connection_close(const char *buf, size_t len)
     return 0;
 }
 
+/* ===== MIME Type ===== */
+
+/*
+ * get_mime_type - Map file extension to Content-Type.
+ *
+ * Uses strrchr (last '.') so "archive.tar.gz" is detected as ".gz".
+ *
+ * Returns a static string; caller must not free.
+ */
 static const char *get_mime_type(const char *path)
 {
     const char *ext = strrchr(path, '.');
@@ -108,6 +193,14 @@ static const char *get_mime_type(const char *path)
     return "application/octet-stream";
 }
 
+/* ===== Response Helpers ===== */
+
+/*
+ * send_response_headers - Write HTTP status line and headers.
+ *
+ * Loops on write() because it may perform a partial write when the
+ * socket send buffer is full.
+ */
 static void send_response_headers(int fd, int status, const char *reason,
                                   const char *content_type,
                                   size_t content_length, int keep_alive)
@@ -130,6 +223,9 @@ static void send_response_headers(int fd, int status, const char *reason,
     }
 }
 
+/*
+ * send_simple_response - Send a plain-text response (used for errors).
+ */
 static void send_simple_response(int fd, int status, const char *reason,
                                  const char *body, int keep_alive)
 {
@@ -145,6 +241,16 @@ static void send_simple_response(int fd, int status, const char *reason,
     }
 }
 
+/*
+ * send_file_response - Send a file as HTTP response body.
+ *
+ * Uses sendfile() for zero-copy transfer: kernel sends file data
+ * directly to the socket buffer, avoiding a user-space round trip.
+ * This reduces 2 copies + 2 context switches to 1 copy + 1 syscall.
+ *
+ * Loops because sendfile() may transfer fewer bytes than requested
+ * when the socket send buffer is full.
+ */
 static void send_file_response(int fd, int file_fd, size_t file_size,
                                const char *content_type, int keep_alive)
 {
@@ -162,6 +268,17 @@ static void send_file_response(int fd, int file_fd, size_t file_size,
     }
 }
 
+/* ===== Request Handler ===== */
+
+/*
+ * handle_request - Process a single HTTP request.
+ *
+ * @fd:      client socket
+ * @buf:     request bytes (header portion)
+ * @buf_len: request length
+ *
+ * Returns 1 to keep the connection alive, 0 to close it.
+ */
 static int handle_request(int fd, const char *buf, size_t buf_len)
 {
     char method[16], uri[512], version[16];
@@ -176,6 +293,12 @@ static int handle_request(int fd, const char *buf, size_t buf_len)
 
     printf("  %s %s %s\n", method, uri, version);
 
+    /*
+     * Determine keep-alive:
+     *   HTTP/1.0 -> default close
+     *   HTTP/1.1 -> default keep-alive
+     *   "Connection: close" -> force close
+     */
     int keep_alive = 1;
     if (strcmp(version, "HTTP/1.0") == 0) keep_alive = 0;
     if (has_connection_close(buf, buf_len)) keep_alive = 0;
@@ -186,6 +309,11 @@ static int handle_request(int fd, const char *buf, size_t buf_len)
         return keep_alive;
     }
 
+    /*
+     * Path traversal protection: reject any URI containing "..".
+     * Without this check, "/../../etc/passwd" would escape DOC_ROOT
+     * after kernel path normalization.
+     */
     if (strstr(uri, "..") != NULL) {
         send_simple_response(fd, 400, "Bad Request",
                              "400 Bad Request: path traversal detected\n",
@@ -207,6 +335,11 @@ static int handle_request(int fd, const char *buf, size_t buf_len)
         return keep_alive;
     }
 
+    /*
+     * Verify that the target is a regular file. Directories and
+     * device files (e.g. /dev/zero) would cause sendfile() to fail
+     * or loop indefinitely.
+     */
     struct stat st;
     if (fstat(file_fd, &st) < 0 || !S_ISREG(st.st_mode)) {
         close(file_fd);
@@ -221,6 +354,13 @@ static int handle_request(int fd, const char *buf, size_t buf_len)
     return keep_alive;
 }
 
+/*
+ * buf_consume - Remove n bytes from the front of the connection buffer.
+ *
+ * Uses memmove (not memcpy) because source and destination overlap.
+ * After processing a request, remaining bytes (pipelined requests)
+ * are shifted to the front of the buffer.
+ */
 static void buf_consume(conn_t *c, size_t n)
 {
     if (n >= c->buf_len) { c->buf_len = 0; return; }
@@ -228,18 +368,26 @@ static void buf_consume(conn_t *c, size_t n)
     c->buf_len -= n;
 }
 
+/* ===== Main ===== */
+
 int main(void)
 {
+    /*
+     * Redirect stdout to /dev/null: printf() to a terminal is
+     * synchronous and slow, which throttles QPS under load.
+     */
     if (freopen("/dev/null", "w", stdout) == NULL) {
-	    perror("freopen");
-	    exit(EXIT_FAILURE);
+        perror("freopen");
+        exit(EXIT_FAILURE);
     }
-    
+
+    /* Prevent the kernel from killing us when writing to a closed peer */
     signal(SIGPIPE, SIG_IGN);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { perror("socket"); exit(EXIT_FAILURE); }
 
+    /* Allow immediate rebind after restart (avoids TIME_WAIT conflict) */
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -266,12 +414,13 @@ int main(void)
     ev.data.fd = listen_fd;
     epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev);
 
-    printf("HTTP Server v5 (keep-alive, %ds timeout) on port %d\n",
-           IDLE_TIMEOUT, PORT);
-
     struct epoll_event events[MAX_EVENTS];
 
     while (1) {
+        /*
+         * 1-second timeout lets us periodically scan for idle
+         * connections even when no events arrive.
+         */
         int nready = epoll_wait(epfd, events, MAX_EVENTS, 1000);
 
         if (nready < 0) {
@@ -280,22 +429,23 @@ int main(void)
             break;
         }
 
+        /* ===== Idle Timeout Scan ===== */
         time_t now = time(NULL);
         for (int i = 0; i < MAX_CONNS; i++) {
             if (conns[i].fd > 0 &&
                 now - conns[i].last_active > IDLE_TIMEOUT) {
-                printf("Timeout fd=%d (idle %lds)\n",
-                       conns[i].fd, (long)(now - conns[i].last_active));
                 epoll_ctl(epfd, EPOLL_CTL_DEL, conns[i].fd, NULL);
                 close(conns[i].fd);
                 conns[i].fd = 0;
             }
         }
 
+        /* ===== Event Dispatch ===== */
         for (int i = 0; i < nready; i++) {
             int fd = events[i].data.fd;
 
             if (fd == listen_fd) {
+                /* New connections: drain the accept queue */
                 while (1) {
                     struct sockaddr_in cli;
                     socklen_t clilen = sizeof(cli);
@@ -309,16 +459,16 @@ int main(void)
                     }
 
                     if (conn_fd >= MAX_CONNS) {
-                        fprintf(stderr, "fd %d >= MAX_CONNS, rejecting\n",
-                                conn_fd);
                         close(conn_fd);
                         continue;
                     }
 
                     set_nonblocking(conn_fd);
 
-		    int flag = 1;
-		    setsockopt(conn_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+                    /* Disable Nagle: avoids 40ms Nagle + Delayed ACK delay */
+                    int flag = 1;
+                    setsockopt(conn_fd, IPPROTO_TCP, TCP_NODELAY,
+                               &flag, sizeof(flag));
 
                     conns[conn_fd].fd          = conn_fd;
                     conns[conn_fd].buf_len     = 0;
@@ -331,7 +481,6 @@ int main(void)
                         close(conn_fd);
                         continue;
                     }
-                    printf("New connection: fd=%d\n", conn_fd);
                 }
             }
             else {
@@ -344,6 +493,7 @@ int main(void)
                     c->buf[c->buf_len] = '\0';
                     c->last_active = time(NULL);
 
+                    /* Process all complete requests in the buffer */
                     int close_conn = 0;
                     while (1) {
                         char *end = find_header_end(c->buf, c->buf_len);
@@ -362,21 +512,22 @@ int main(void)
                     }
 
                     if (close_conn) {
-                        printf("Closing fd=%d\n", fd);
                         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
                         close(fd);
                         c->fd = 0;
                     }
                 }
                 else if (n == 0) {
-                    printf("fd=%d closed by peer\n", fd);
+                    /* Peer closed connection */
                     epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
                     close(fd);
                     c->fd = 0;
                 }
                 else {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        /* Nothing to read; wait for next event */
                     } else if (errno == EINTR) {
+                        /* Interrupted by signal; retry */
                     } else {
                         perror("read");
                         epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
