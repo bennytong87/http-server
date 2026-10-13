@@ -19,8 +19,6 @@ A high-concurrency HTTP/1.1 server implemented in C using epoll.
 
 ## Run
 
-    mkdir -p www
-    echo '<h1>Hello</h1>' > www/index.html
     ./server
 
 ## Test
